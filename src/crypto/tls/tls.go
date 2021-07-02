@@ -26,6 +26,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"go-msspi"
 )
 
 // Server returns a new TLS server side connection
@@ -38,6 +40,20 @@ func Server(conn net.Conn, config *Config) *Conn {
 		config: config,
 	}
 	c.handshakeFn = c.serverHandshake
+
+	// msspi
+	if msspi.ByDefault || c.config.msspiConfig || (len(c.config.Certificates) > 0 && c.config.Certificates[0].msspiCert) {
+		c.msspiConn = true
+		c.handshakeFn = c.msspiHandshake
+
+		CertificateBytes := [][]byte{}
+		for _, cert := range config.Certificates {
+			CertificateBytes = append(CertificateBytes, cert.Certificate[0])
+		}
+
+		c.msspi, c.msspiErr = msspi.Server(&c.conn, CertificateBytes, c.config.ClientAuth != NoClientCert)
+	}
+
 	return c
 }
 
@@ -52,6 +68,20 @@ func Client(conn net.Conn, config *Config) *Conn {
 		isClient: true,
 	}
 	c.handshakeFn = c.clientHandshake
+
+	// msspi
+	if msspi.ByDefault || c.config.msspiConfig || (len(c.config.Certificates) > 0 && c.config.Certificates[0].msspiCert) {
+		c.msspiConn = true
+		c.handshakeFn = c.msspiHandshake
+
+		CertificateBytes := [][]byte{}
+		for _, cert := range config.Certificates {
+			CertificateBytes = append(CertificateBytes, cert.Certificate[0])
+		}
+
+		c.msspi, c.msspiErr = msspi.Client(&c.conn, CertificateBytes, c.config.ServerName)
+	}
+
 	return c
 }
 
@@ -276,6 +306,12 @@ func LoadX509KeyPair(certFile, keyFile string) (Certificate, error) {
 func X509KeyPair(certPEMBlock, keyPEMBlock []byte) (Certificate, error) {
 	fail := func(err error) (Certificate, error) { return Certificate{}, err }
 
+	// msspi
+	msspiCert := false
+	if bytes.Equal(certPEMBlock, keyPEMBlock) {
+		msspiCert = true
+	}
+
 	var cert Certificate
 	var skippedBlockTypes []string
 	for {
@@ -299,6 +335,12 @@ func X509KeyPair(certPEMBlock, keyPEMBlock []byte) (Certificate, error) {
 			return fail(errors.New("tls: failed to find certificate PEM data in certificate input, but did find a private key; PEM inputs may have been switched"))
 		}
 		return fail(fmt.Errorf("tls: failed to find \"CERTIFICATE\" PEM block in certificate input after skipping PEM blocks of the following types: %v", skippedBlockTypes))
+	}
+
+	// msspi
+	if msspiCert {
+		cert.msspiCert = msspiCert
+		return cert, nil
 	}
 
 	skippedBlockTypes = skippedBlockTypes[:0]
