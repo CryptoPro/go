@@ -1,0 +1,6 @@
+[submodule "src/go-msspi"]
+	path = src/go-msspi
+	url = https://github.com/deemru/go-msspi.git
+[submodule "src/go-pointer"]
+	path = src/go-pointer
+	url = https://github.com/mattn/go-pointer.git
