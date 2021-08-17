@@ -1495,6 +1495,7 @@ func (c *Conn) msspiHandshake() error {
 
 		c.vers = c.msspi.VersionTLS()
 		c.cipherSuite = c.msspi.CipherSuite()
+		c.clientProtocol = c.msspi.ClientProtocol()
 
 		if c.config.ServerName != "" {
 			c.serverName = c.config.ServerName

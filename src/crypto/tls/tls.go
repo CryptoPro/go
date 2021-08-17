@@ -52,6 +52,10 @@ func Server(conn net.Conn, config *Config) *Conn {
 		}
 
 		c.msspi, c.msspiErr = msspi.Server(&c.conn, CertificateBytes, c.config.ClientAuth != NoClientCert)
+
+		if len(config.NextProtos) > 0 {
+			c.msspi.SetNextProtos(config.NextProtos)
+		}
 	}
 
 	return c
@@ -80,6 +84,10 @@ func Client(conn net.Conn, config *Config) *Conn {
 		}
 
 		c.msspi, c.msspiErr = msspi.Client(&c.conn, CertificateBytes, c.config.ServerName)
+
+		if len(config.NextProtos) > 0 {
+			c.msspi.SetNextProtos(config.NextProtos)
+		}
 	}
 
 	return c
