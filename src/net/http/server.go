@@ -577,36 +577,16 @@ func (w *response) ReadFrom(src io.Reader) (n int64, err error) {
 		return io.CopyBuffer(writerOnly{w}, src, buf)
 	}
 
-	// sendfile path:
-
-	// Do not start actually writing response until src is readable.
-	// If body length is <= sniffLen, sendfile/splice path will do
-	// little anyway. This small read also satisfies sniffing the
-	// body in case Content-Type is missing.
-	nr, er := src.Read(buf[:sniffLen])
-	atEOF := errors.Is(er, io.EOF)
-	n += int64(nr)
-
-	if nr > 0 {
-		// Write the small amount read normally.
-		nw, ew := w.Write(buf[:nr])
-		if ew != nil {
-			err = ew
-		} else if nr != nw {
-			err = io.ErrShortWrite
+	// Copy the first sniffLen bytes before switching to ReadFrom.
+	// This ensures we don't start writing the response before the
+	// source is available (see golang.org/issue/5660) and provides
+	// enough bytes to perform Content-Type sniffing when required.
+	if !w.cw.wroteHeader {
+		n0, err := io.CopyBuffer(writerOnly{w}, io.LimitReader(src, sniffLen), buf)
+		n += n0
+		if err != nil || n0 < sniffLen {
+			return n, err
 		}
-	}
-	if err == nil && er != nil && !atEOF {
-		err = er
-	}
-
-	// Do not send StatusOK in the error case where nothing has been written.
-	if err == nil && !w.wroteHeader {
-		w.WriteHeader(StatusOK) // nr == 0, no error (or EOF)
-	}
-
-	if err != nil || atEOF {
-		return n, err
 	}
 
 	w.w.Flush()  // get rid of any previous writes
@@ -620,7 +600,7 @@ func (w *response) ReadFrom(src io.Reader) (n int64, err error) {
 		return n, err
 	}
 
-	n0, err := io.Copy(writerOnly{w}, src)
+	n0, err := io.CopyBuffer(writerOnly{w}, src, buf)
 	n += n0
 	return n, err
 }
@@ -1427,11 +1407,11 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 		hasCL = false
 	}
 
-	if w.req.Method == "HEAD" || !bodyAllowedForStatus(code) {
-		// do nothing
-	} else if code == StatusNoContent {
+	if w.req.Method == "HEAD" || !bodyAllowedForStatus(code) || code == StatusNoContent {
+		// Response has no body.
 		delHeader("Transfer-Encoding")
 	} else if hasCL {
+		// Content-Length has been provided, so no chunking is to be done.
 		delHeader("Transfer-Encoding")
 	} else if w.req.ProtoAtLeast(1, 1) {
 		// HTTP/1.1 or greater: Transfer-Encoding has been set to identity, and no
@@ -1442,6 +1422,7 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 		if hasTE && te == "identity" {
 			cw.chunking = false
 			w.closeAfterReply = true
+			delHeader("Transfer-Encoding")
 		} else {
 			// HTTP/1.1 or greater: use chunked transfer encoding
 			// to avoid closing the connection at EOF.
