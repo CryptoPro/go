@@ -516,6 +516,9 @@ const (
 // modified. A Config may be reused; the tls package will also not
 // modify it.
 type Config struct {
+	// msspi
+	msspiConfig bool
+
 	// Rand provides the source of entropy for nonces and RSA blinding.
 	// If Rand is nil, TLS uses the cryptographic random reader in package
 	// crypto/rand.
@@ -1348,6 +1351,9 @@ var writerMutex sync.Mutex
 
 // A Certificate is a chain of one or more certificates, leaf first.
 type Certificate struct {
+	// msspi
+	msspiCert bool
+
 	Certificate [][]byte
 	// PrivateKey contains the private key corresponding to the public key in
 	// Leaf. This must implement crypto.Signer with an RSA, ECDSA or Ed25519 PublicKey.

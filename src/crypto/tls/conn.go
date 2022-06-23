@@ -20,11 +20,18 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"go-msspi"
 )
 
 // A Conn represents a secured connection.
 // It implements the net.Conn interface.
 type Conn struct {
+	// msspi
+	msspiConn bool
+	msspiErr  error
+	msspi     *msspi.Handler
+
 	// constant
 	conn        net.Conn
 	isClient    bool
@@ -1124,6 +1131,31 @@ func (c *Conn) Write(b []byte) (int, error) {
 	c.out.Lock()
 	defer c.out.Unlock()
 
+	// msspi
+	if c.msspiConn {
+		if c.msspi != nil {
+			n, err := c.msspi.Write(b)
+			if n > 0 {
+				return n, err
+			}
+
+			if err == nil {
+				if c.msspi.State(1) {
+					err = net.ErrClosed
+				} else if c.msspi.State(2) {
+					err = errShutdown
+				} else {
+					err = io.EOF
+				}
+			}
+
+			c.out.setErrorLocked(err)
+			return n, c.out.err
+		} else {
+			return 0, net.ErrClosed
+		}
+	}
+
 	if err := c.out.err; err != nil {
 		return 0, err
 	}
@@ -1281,6 +1313,31 @@ func (c *Conn) Read(b []byte) (int, error) {
 	c.in.Lock()
 	defer c.in.Unlock()
 
+	// msspi
+	if c.msspiConn {
+		if c.msspi != nil {
+			n, err := c.msspi.Read(b)
+			if n > 0 {
+				return n, err
+			}
+
+			if err == nil {
+				if c.msspi.State(1) {
+					err = net.ErrClosed
+				} else if c.msspi.State(2) {
+					err = io.EOF
+				} else {
+					err = io.EOF
+				}
+			}
+
+			c.in.setErrorLocked(err)
+			return n, c.in.err
+		} else {
+			return 0, net.ErrClosed
+		}
+	}
+
 	for c.input.Len() == 0 {
 		if err := c.readRecord(); err != nil {
 			return 0, err
@@ -1334,6 +1391,17 @@ func (c *Conn) Close() error {
 		return c.conn.Close()
 	}
 
+	// msspi
+	if c.msspiConn {
+		if c.msspi != nil {
+			err := c.msspi.Close()
+			c.msspi = nil
+			return err
+		} else {
+			return net.ErrClosed
+		}
+	}
+
 	var alertErr error
 	if c.handshakeComplete() {
 		if err := c.closeNotify(); err != nil {
@@ -1363,6 +1431,15 @@ func (c *Conn) CloseWrite() error {
 func (c *Conn) closeNotify() error {
 	c.out.Lock()
 	defer c.out.Unlock()
+
+	// msspi
+	if c.msspiConn {
+		if c.msspi != nil {
+			return c.msspi.Shutdown()
+		} else {
+			return errShutdown
+		}
+	}
 
 	if !c.closeNotifySent {
 		// Set a Write Deadline to prevent possibly blocking forever.
@@ -1474,6 +1551,84 @@ func (c *Conn) handshakeContext(ctx context.Context) (ret error) {
 	}
 
 	return c.handshakeErr
+}
+
+// msspi
+// msspiHandshake handshakes msspi
+func (c *Conn) msspiHandshake(ctx context.Context) error {
+	if c.msspi == nil {
+		return c.msspiErr
+	}
+
+	err := c.msspi.Handshake()
+	if err != nil {
+		return err
+	}
+
+	atomic.StoreUint32(&c.handshakeStatus, 1)
+
+	c.vers = c.msspi.VersionTLS()
+	c.cipherSuite = c.msspi.CipherSuite()
+	c.clientProtocol = c.msspi.ClientProtocol()
+
+	if c.config.ServerName != "" {
+		c.serverName = c.config.ServerName
+	}
+
+	var isPeerCertsRequest bool
+	var isPeerCertsRequire bool
+	var isPeerCertsVerify bool
+
+	if c.isClient {
+		isPeerCertsRequest = true
+		isPeerCertsRequire = true
+		isPeerCertsVerify = !c.config.InsecureSkipVerify
+	} else {
+		isPeerCertsRequest = c.config.ClientAuth != NoClientCert
+		isPeerCertsRequire = requiresClientCert(c.config.ClientAuth)
+		isPeerCertsVerify = c.config.ClientAuth >= VerifyClientCertIfGiven
+	}
+
+	if isPeerCertsRequest {
+		certificates := c.msspi.PeerCertificates()
+
+		certs := make([]*x509.Certificate, len(certificates))
+		for i, asn1Data := range certificates {
+			cert, err := x509.ParseCertificate(asn1Data)
+			if err == nil {
+				certs[i] = cert
+			}
+		}
+
+		c.peerCertificates = certs
+	}
+
+	isPeerCerts := len(c.peerCertificates) != 0
+
+	if isPeerCertsRequire && !isPeerCerts {
+		return errors.New("tls: peer didn't provide a certificate")
+	}
+
+	if isPeerCertsVerify && isPeerCerts {
+		certificates := c.msspi.VerifiedChains()
+
+		if certificates == nil {
+			return errors.New("tls: failed to verify peer certificate")
+		}
+
+		certs := make([]*x509.Certificate, len(certificates))
+		for i, asn1Data := range certificates {
+			cert, err := x509.ParseCertificate(asn1Data)
+			if err == nil {
+				certs[i] = cert
+			}
+		}
+
+		var verifiedChains [][]*x509.Certificate
+		c.verifiedChains = append(verifiedChains, certs)
+	}
+
+	return nil
 }
 
 // ConnectionState returns basic TLS details about the connection.
