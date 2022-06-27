@@ -1565,8 +1565,6 @@ func (c *Conn) msspiHandshake(ctx context.Context) error {
 		return err
 	}
 
-	atomic.StoreUint32(&c.handshakeStatus, 1)
-
 	c.vers = c.msspi.VersionTLS()
 	c.cipherSuite = c.msspi.CipherSuite()
 	c.clientProtocol = c.msspi.ClientProtocol()
@@ -1627,6 +1625,8 @@ func (c *Conn) msspiHandshake(ctx context.Context) error {
 		var verifiedChains [][]*x509.Certificate
 		c.verifiedChains = append(verifiedChains, certs)
 	}
+
+	atomic.StoreUint32(&c.handshakeStatus, 1)
 
 	return nil
 }
