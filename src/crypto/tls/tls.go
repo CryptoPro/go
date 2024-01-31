@@ -25,6 +25,8 @@ import (
 	"net"
 	"os"
 	"strings"
+
+	"go-msspi"
 )
 
 // Server returns a new TLS server side connection
@@ -37,6 +39,28 @@ func Server(conn net.Conn, config *Config) *Conn {
 		config: config,
 	}
 	c.handshakeFn = c.serverHandshake
+
+	// msspi
+	if msspi.ByDefault || c.config.msspiConfig || (len(c.config.Certificates) > 0 && c.config.Certificates[0].msspiCert) {
+		c.msspiConn = true
+		c.handshakeFn = c.msspiHandshake
+
+		CertificateBytes := [][]byte{}
+		for _, cert := range config.Certificates {
+			CertificateBytes = append(CertificateBytes, cert.Certificate[0])
+		}
+
+		c.msspi, c.msspiErr = msspi.Server(&c.conn, CertificateBytes, c.config.ClientAuth != NoClientCert)
+
+		if c.msspi == nil {
+			return c
+		}
+
+		if len(config.NextProtos) > 0 {
+			c.msspi.SetNextProtos(config.NextProtos)
+		}
+	}
+
 	return c
 }
 
@@ -51,6 +75,28 @@ func Client(conn net.Conn, config *Config) *Conn {
 		isClient: true,
 	}
 	c.handshakeFn = c.clientHandshake
+
+	// msspi
+	if msspi.ByDefault || c.config.msspiConfig || (len(c.config.Certificates) > 0 && c.config.Certificates[0].msspiCert) {
+		c.msspiConn = true
+		c.handshakeFn = c.msspiHandshake
+
+		CertificateBytes := [][]byte{}
+		for _, cert := range config.Certificates {
+			CertificateBytes = append(CertificateBytes, cert.Certificate[0])
+		}
+
+		c.msspi, c.msspiErr = msspi.Client(&c.conn, CertificateBytes, c.config.ServerName)
+
+		if c.msspi == nil {
+			return c
+		}
+
+		if len(config.NextProtos) > 0 {
+			c.msspi.SetNextProtos(config.NextProtos)
+		}
+	}
+
 	return c
 }
 
@@ -244,6 +290,14 @@ func LoadX509KeyPair(certFile, keyFile string) (Certificate, error) {
 // the parsed form of the certificate is not retained.
 func X509KeyPair(certPEMBlock, keyPEMBlock []byte) (Certificate, error) {
 	fail := func(err error) (Certificate, error) { return Certificate{}, err }
+
+	// msspi
+	if bytes.Equal(certPEMBlock, keyPEMBlock) {
+		var cert Certificate
+		cert.Certificate = append(cert.Certificate, certPEMBlock)
+		cert.msspiCert = true
+		return cert, nil
+	}
 
 	var cert Certificate
 	var skippedBlockTypes []string
