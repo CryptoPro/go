@@ -1743,7 +1743,7 @@ func (c *Conn) msspiHandshake(ctx context.Context) error {
 		c.verifiedChains = append(verifiedChains, certs)
 	}
 
-	atomic.StoreUint32(&c.handshakeStatus, 1)
+	c.isHandshakeComplete.Store(true)
 
 	return nil
 }
