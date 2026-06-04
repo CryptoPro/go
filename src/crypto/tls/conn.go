@@ -21,11 +21,21 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"go-msspi"
 )
 
 // A Conn represents a secured connection.
 // It implements the net.Conn interface.
 type Conn struct {
+	// msspiConn selects the msspi (CryptoPro CSP) stack for this connection; the
+	// remaining fields hold its state.
+	msspiConn      bool
+	msspiErr       error       // deferred error from msspi.Client/Server
+	msspi          *msspi.Conn // the CSP connection; nil after Close
+	msspiVerified  bool        // peer verification has already run
+	msspiVerifyErr error       // peer-verification result, surfaced by the handshake
+
 	// constant
 	conn        net.Conn
 	isClient    bool
@@ -1219,6 +1229,30 @@ func (c *Conn) Write(b []byte) (int, error) {
 	c.out.Lock()
 	defer c.out.Unlock()
 
+	if c.msspiConn {
+		if m := c.msspi; m != nil {
+			n, err := m.Write(b)
+			if n > 0 {
+				return n, err
+			}
+
+			if err == nil {
+				if m.State(1) {
+					err = net.ErrClosed
+				} else if m.State(2) {
+					err = errShutdown
+				} else {
+					err = io.EOF
+				}
+			}
+
+			c.out.setErrorLocked(err)
+			return n, c.out.err
+		} else {
+			return 0, net.ErrClosed
+		}
+	}
+
 	if err := c.out.err; err != nil {
 		return 0, err
 	}
@@ -1389,6 +1423,30 @@ func (c *Conn) Read(b []byte) (int, error) {
 	c.in.Lock()
 	defer c.in.Unlock()
 
+	if c.msspiConn {
+		if m := c.msspi; m != nil {
+			n, err := m.Read(b)
+			if n > 0 {
+				return n, err
+			}
+
+			if err == nil {
+				if m.State(1) {
+					err = net.ErrClosed
+				} else if m.State(2) {
+					err = io.EOF
+				} else {
+					err = io.ErrUnexpectedEOF
+				}
+			}
+
+			c.in.setErrorLocked(err)
+			return n, c.in.err
+		} else {
+			return 0, net.ErrClosed
+		}
+	}
+
 	for c.input.Len() == 0 {
 		if err := c.readRecord(); err != nil {
 			return 0, err
@@ -1442,6 +1500,16 @@ func (c *Conn) Close() error {
 		return c.conn.Close()
 	}
 
+	if c.msspiConn {
+		if c.msspi != nil {
+			err := c.msspi.Close()
+			c.msspi = nil
+			return err
+		} else {
+			return net.ErrClosed
+		}
+	}
+
 	var alertErr error
 	if c.isHandshakeComplete.Load() {
 		if err := c.closeNotify(); err != nil {
@@ -1471,6 +1539,14 @@ func (c *Conn) CloseWrite() error {
 func (c *Conn) closeNotify() error {
 	c.out.Lock()
 	defer c.out.Unlock()
+
+	if c.msspiConn {
+		if c.msspi != nil {
+			return c.msspi.Shutdown()
+		} else {
+			return errShutdown
+		}
+	}
 
 	if !c.closeNotifySent {
 		// Set a Write Deadline to prevent possibly blocking forever.
@@ -1602,6 +1678,190 @@ func (c *Conn) handshakeContext(ctx context.Context) (ret error) {
 	}
 
 	return c.handshakeErr
+}
+
+// msspiHandshake runs the CSP handshake and then verifies the peer, leaving the
+// connection ready for application data.
+func (c *Conn) msspiHandshake(ctx context.Context) error {
+	if c.msspi == nil {
+		return c.msspiErr
+	}
+
+	err := c.msspi.Handshake()
+	// In mutual TLS the peer is verified from within the handshake (cert_cb),
+	// before the client certificate is presented; surface that error verbatim.
+	if c.msspiVerifyErr != nil {
+		return c.msspiVerifyErr
+	}
+	if err != nil {
+		return err
+	}
+
+	c.vers = c.msspi.VersionTLS()
+	c.cipherSuite = c.msspi.CipherSuite()
+	c.clientProtocol = c.msspi.ClientProtocol()
+
+	if c.config.ServerName != "" {
+		c.serverName = c.config.ServerName
+	}
+
+	// One-way TLS and the server side do not go through cert_cb, so verify here.
+	// In mutual TLS this is a no-op (already verified before the client cert).
+	if err := c.msspiVerifyPeer(); err != nil {
+		return err
+	}
+
+	c.isHandshakeComplete.Store(true)
+
+	return nil
+}
+
+// msspiVerifyPeer validates the peer certificate and runs the configured
+// verification hooks (VerifyPeerCertificate, VerifyConnection). It is
+// idempotent: whether first reached from the handshake's cert_cb (mutual TLS,
+// before the client certificate is sent) or after the handshake (one-way TLS
+// and the server side), the verification runs exactly once.
+func (c *Conn) msspiVerifyPeer() error {
+	if c.msspiVerified {
+		return c.msspiVerifyErr
+	}
+	c.msspiVerified = true
+	c.msspiVerifyErr = c.msspiVerifyPeerLocked()
+	return c.msspiVerifyErr
+}
+
+func (c *Conn) msspiVerifyPeerLocked() error {
+	var request, require, verify bool
+	if c.isClient {
+		request, require, verify = true, true, !c.config.InsecureSkipVerify
+	} else {
+		request = c.config.ClientAuth != NoClientCert
+		require = requiresClientCert(c.config.ClientAuth)
+		verify = c.config.ClientAuth >= VerifyClientCertIfGiven
+	}
+
+	if !request {
+		return nil
+	}
+
+	rawCerts := c.msspi.PeerCertificates()
+	certs := make([]*x509.Certificate, 0, len(rawCerts))
+	for _, asn1Data := range rawCerts {
+		if cert, err := x509.ParseCertificate(asn1Data); err == nil {
+			certs = append(certs, cert)
+		}
+	}
+	c.peerCertificates = certs
+
+	if len(certs) == 0 {
+		if require {
+			return errors.New("tls: peer didn't provide a certificate")
+		}
+		return nil
+	}
+
+	if verify {
+		status, ok := c.msspi.VerifyStatus()
+		if !ok {
+			return errors.New("tls: msspi could not run peer verification")
+		}
+		if status != 0 && !msspiStatusIgnored(c.config.MsspiIgnoredVerifyStatuses, status) {
+			return &MsspiVerifyError{Status: status}
+		}
+		chains := c.msspi.PeerChain()
+		verifiedCerts := make([]*x509.Certificate, 0, len(chains))
+		for _, asn1Data := range chains {
+			if cert, err := x509.ParseCertificate(asn1Data); err == nil {
+				verifiedCerts = append(verifiedCerts, cert)
+			}
+		}
+		c.verifiedChains = [][]*x509.Certificate{verifiedCerts}
+	}
+
+	// Populate connection state for the hooks. In mutual TLS this runs
+	// mid-handshake (from cert_cb), so set what is already known.
+	if c.config.ServerName != "" {
+		c.serverName = c.config.ServerName
+	}
+	c.vers = c.msspi.VersionTLS()
+	c.cipherSuite = c.msspi.CipherSuite()
+
+	if c.config.VerifyPeerCertificate != nil {
+		if err := c.config.VerifyPeerCertificate(rawCerts, c.verifiedChains); err != nil {
+			return err
+		}
+	}
+	if c.config.VerifyConnection != nil {
+		if err := c.config.VerifyConnection(c.connectionStateLocked()); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// MsspiVerifyError reports that CSP certificate verification failed with the
+// given status code (a Windows certificate error; see the Msspi*Err* constants).
+type MsspiVerifyError struct {
+	Status uint32
+}
+
+func (e *MsspiVerifyError) Error() string {
+	if name := msspiVerifyStatusNames[e.Status]; name != "" {
+		return fmt.Sprintf("tls: msspi peer verification failed: %s (0x%08x)", name, e.Status)
+	}
+	return fmt.Sprintf("tls: msspi peer verification failed: status 0x%08x", e.Status)
+}
+
+// CSP certificate-verification status codes, for use in
+// Config.MsspiIgnoredVerifyStatuses.
+const (
+	MsspiTrustErrCertSignature        uint32 = 0x80096004
+	MsspiCryptErrRevoked              uint32 = 0x80092010
+	MsspiCertErrUntrustedRoot         uint32 = 0x800b0109
+	MsspiCertErrUntrustedTestRoot     uint32 = 0x800b010d
+	MsspiCertErrChaining              uint32 = 0x800b010a
+	MsspiCertErrRevocationFailure     uint32 = 0x800b010e
+	MsspiCertErrWrongUsage            uint32 = 0x800b0110
+	MsspiCertErrExpired               uint32 = 0x800b0101
+	MsspiCertErrInvalidName           uint32 = 0x800b0114
+	MsspiCertErrCNNoMatch             uint32 = 0x800b010f
+	MsspiCertErrInvalidPolicy         uint32 = 0x800b0113
+	MsspiTrustErrBasicConstraints     uint32 = 0x80096019
+	MsspiCertErrCritical              uint32 = 0x800b0105
+	MsspiCertErrValidityPeriodNesting uint32 = 0x800b0102
+	MsspiCryptErrNoRevocationCheck    uint32 = 0x80092012
+	MsspiCryptErrRevocationOffline    uint32 = 0x80092013
+	MsspiCertErrRole                  uint32 = 0x800b0103
+)
+
+var msspiVerifyStatusNames = map[uint32]string{
+	MsspiTrustErrCertSignature:        "TRUST_E_CERT_SIGNATURE",
+	MsspiCryptErrRevoked:              "CRYPT_E_REVOKED",
+	MsspiCertErrUntrustedRoot:         "CERT_E_UNTRUSTEDROOT",
+	MsspiCertErrUntrustedTestRoot:     "CERT_E_UNTRUSTEDTESTROOT",
+	MsspiCertErrChaining:              "CERT_E_CHAINING",
+	MsspiCertErrRevocationFailure:     "CERT_E_REVOCATION_FAILURE",
+	MsspiCertErrWrongUsage:            "CERT_E_WRONG_USAGE",
+	MsspiCertErrExpired:               "CERT_E_EXPIRED",
+	MsspiCertErrInvalidName:           "CERT_E_INVALID_NAME",
+	MsspiCertErrCNNoMatch:             "CERT_E_CN_NO_MATCH",
+	MsspiCertErrInvalidPolicy:         "CERT_E_INVALID_POLICY",
+	MsspiTrustErrBasicConstraints:     "TRUST_E_BASIC_CONSTRAINTS",
+	MsspiCertErrCritical:              "CERT_E_CRITICAL",
+	MsspiCertErrValidityPeriodNesting: "CERT_E_VALIDITYPERIODNESTING",
+	MsspiCryptErrNoRevocationCheck:    "CRYPT_E_NO_REVOCATION_CHECK",
+	MsspiCryptErrRevocationOffline:    "CRYPT_E_REVOCATION_OFFLINE",
+	MsspiCertErrRole:                  "CERT_E_ROLE",
+}
+
+func msspiStatusIgnored(ignored []uint32, status uint32) bool {
+	for _, s := range ignored {
+		if s == status {
+			return true
+		}
+	}
+	return false
 }
 
 // ConnectionState returns basic TLS details about the connection.

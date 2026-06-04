@@ -564,6 +564,19 @@ const (
 // modified. A Config may be reused; the tls package will also not
 // modify it.
 type Config struct {
+	// MsspiByCertOnly limits the msspi (CryptoPro CSP) stack to connections that
+	// present a CSP-backed certificate (one loaded by X509KeyPair with identical
+	// certificate and key inputs). When false (the default), every connection
+	// uses msspi. When true, connections without such a certificate — one-way
+	// TLS and ordinary Go certificates — use the standard Go TLS stack.
+	MsspiByCertOnly bool
+
+	// MsspiIgnoredVerifyStatuses lists CSP certificate-verification status codes
+	// (see the Msspi*Err* constants) that are treated as success for this
+	// connection. For example, include MsspiCryptErrNoRevocationCheck to accept a
+	// peer whose certificate revocation status could not be determined.
+	MsspiIgnoredVerifyStatuses []uint32
+
 	// Rand provides the source of entropy for nonces and RSA blinding.
 	// If Rand is nil, TLS uses the cryptographic random reader in package
 	// crypto/rand.
@@ -1608,6 +1621,11 @@ var writerMutex sync.Mutex
 
 // A Certificate is a chain of one or more certificates, leaf first.
 type Certificate struct {
+	// msspiCert reports a CSP-backed certificate whose private key lives in a CSP
+	// key container. It is set by X509KeyPair when the certificate and key inputs
+	// are identical.
+	msspiCert bool
+
 	Certificate [][]byte
 	// PrivateKey contains the private key corresponding to the public key in
 	// Leaf. This must implement [crypto.Signer] with an RSA, ECDSA or Ed25519
