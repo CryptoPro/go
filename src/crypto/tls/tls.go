@@ -24,6 +24,7 @@ package tls
 // https://www.imperialviolet.org/2013/02/04/luckythirteen.html.
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ecdsa"
@@ -37,6 +38,8 @@ import (
 	"net"
 	"os"
 	"strings"
+
+	"go-msspi"
 )
 
 // Server returns a new TLS server side connection
@@ -49,6 +52,29 @@ func Server(conn net.Conn, config *Config) *Conn {
 		config: config,
 	}
 	c.handshakeFn = c.serverHandshake
+
+	// Use msspi (CryptoPro CSP) for this connection unless MsspiByCertOnly opts
+	// out and no CSP-backed certificate is present.
+	if !c.config.MsspiByCertOnly || (len(c.config.Certificates) > 0 && c.config.Certificates[0].msspiCert) {
+		c.msspiConn = true
+		c.handshakeFn = c.msspiHandshake
+
+		CertificateBytes := [][]byte{}
+		for _, cert := range config.Certificates {
+			CertificateBytes = append(CertificateBytes, cert.Certificate[0])
+		}
+
+		c.msspi, c.msspiErr = msspi.Server(&c.conn, CertificateBytes, c.config.ClientAuth != NoClientCert)
+
+		if c.msspi == nil {
+			return c
+		}
+
+		if len(config.NextProtos) > 0 {
+			c.msspi.SetNextProtos(config.NextProtos)
+		}
+	}
+
 	return c
 }
 
@@ -63,6 +89,29 @@ func Client(conn net.Conn, config *Config) *Conn {
 		isClient: true,
 	}
 	c.handshakeFn = c.clientHandshake
+
+	// Use msspi (CryptoPro CSP) for this connection unless MsspiByCertOnly opts
+	// out and no CSP-backed certificate is present.
+	if !c.config.MsspiByCertOnly || (len(c.config.Certificates) > 0 && c.config.Certificates[0].msspiCert) {
+		c.msspiConn = true
+		c.handshakeFn = c.msspiHandshake
+
+		CertificateBytes := [][]byte{}
+		for _, cert := range config.Certificates {
+			CertificateBytes = append(CertificateBytes, cert.Certificate[0])
+		}
+
+		c.msspi, c.msspiErr = msspi.Client(&c.conn, CertificateBytes, c.config.ServerName, c.msspiVerifyPeer)
+
+		if c.msspi == nil {
+			return c
+		}
+
+		if len(config.NextProtos) > 0 {
+			c.msspi.SetNextProtos(config.NextProtos)
+		}
+	}
+
 	return c
 }
 
@@ -265,6 +314,16 @@ var x509keypairleaf = godebug.New("x509keypairleaf")
 // in the GODEBUG environment variable.
 func X509KeyPair(certPEMBlock, keyPEMBlock []byte) (Certificate, error) {
 	fail := func(err error) (Certificate, error) { return Certificate{}, err }
+
+	// Identical certificate and key inputs mark a CSP-backed certificate: the
+	// private key stays in its CSP key container and the bytes are matched
+	// against the store, rather than parsed as a PEM key pair.
+	if bytes.Equal(certPEMBlock, keyPEMBlock) {
+		var cert Certificate
+		cert.Certificate = append(cert.Certificate, certPEMBlock)
+		cert.msspiCert = true
+		return cert, nil
+	}
 
 	var cert Certificate
 	var skippedBlockTypes []string
